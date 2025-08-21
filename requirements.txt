@@ -3,4 +3,5 @@ lasio
 pyavo
 numpy
 pandas
+plotly
 matplotlib
