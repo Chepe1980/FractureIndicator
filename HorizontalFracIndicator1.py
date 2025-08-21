@@ -185,8 +185,8 @@ if calculate_btn:
         VP_VS_interval = VP_VS_interval[valid_idx]
         FRAC_ESTIMATE = FRAC_ESTIMATE[valid_idx]
         
-        # Calculate correlation for different theta values
-        theta_values = np.linspace(0, 180, 181)  # 0 to 180 degrees in 1-degree increments
+        # Calculate correlation for different theta values (0° to 360°)
+        theta_values = np.linspace(0, 360, 361)  # 0 to 360 degrees in 1-degree increments
         correlations = []
         
         for theta in theta_values:
@@ -233,6 +233,7 @@ if calculate_btn:
                   f'<i>Depth: {depth_range[0]:.1f}m - {depth_range[1]:.1f}m</i>',
             xaxis_title='Rotation Angle θ (degrees)',
             yaxis_title='Correlation Coefficient (R)',
+            xaxis=dict(range=[0, 360]),  # Ensure full azimuth is shown
             hovermode="x unified",
             template="plotly_white",
             height=500
