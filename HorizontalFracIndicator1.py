@@ -1,6 +1,7 @@
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import pearsonr
+from scipy.signal import savgol_filter
 import lasio
 import streamlit as st
 import io
@@ -16,7 +17,7 @@ st.set_page_config(
 st.title("Horizontal Fracture (HF) Analysis")
 st.markdown("""
 This app performs Horizontal Fracture (HF) analysis on well log data to find the optimal rotation angle 
-that correlates seismic attributes with fracture density.
+that correlates seismic attributes with fracture indicators.
 """)
 
 # Sidebar for file upload and parameters
@@ -46,36 +47,36 @@ with st.sidebar:
         vp_curve = st.selectbox("P-Wave Velocity Curve", options=curve_names, index=min(2, len(curve_names)-1))
         vs_curve = st.selectbox("S-Wave Velocity Curve", options=curve_names, index=min(3, len(curve_names)-1))
         
-        # Fracture density curve selection (critical addition)
-        if 'FRAC_DEN' in curve_names or 'FRAC_DENS' in curve_names:
-            # Try to find fracture density curve automatically
-            frac_options = [name for name in curve_names if 'FRAC' in name.upper() or 'DEN' in name.upper()]
-            default_frac_index = 0 if frac_options else 0
-        else:
-            frac_options = curve_names
-            default_frac_index = min(4, len(curve_names)-1) if len(curve_names) > 4 else 0
-            
-        frac_curve = st.selectbox("Fracture Density Curve (εf)", 
-                                 options=frac_options, 
-                                 index=default_frac_index,
-                                 help="Select the curve containing fracture density measurements")
+        # Method selection for fracture proxy
+        st.subheader("Fracture Density Estimation Method")
+        method = st.radio(
+            "Select method to estimate fracture density:",
+            ["S-Wave Velocity Anomaly", "P-Wave Velocity Anomaly", "Impedance Contrast", 
+             "Sonic Log DTCO", "Manual Curve Selection"]
+        )
+        
+        # Additional parameters based on method
+        if method == "Manual Curve Selection":
+            frac_curve = st.selectbox("Select Fracture Proxy Curve", options=curve_names, 
+                                     index=min(4, len(curve_names)-1))
+        elif method == "Sonic Log DTCO":
+            if any('DTCO' in name.upper() or 'DTC' in name.upper() for name in curve_names):
+                dtco_options = [name for name in curve_names if 'DTCO' in name.upper() or 'DTC' in name.upper()]
+                dtco_curve = st.selectbox("Select Sonic Curve (DTCO)", options=dtco_options, index=0)
+            else:
+                st.warning("No DTCO or DTC curve found. Using manual selection.")
+                method = "Manual Curve Selection"
+                frac_curve = st.selectbox("Select Fracture Proxy Curve", options=curve_names, 
+                                         index=min(4, len(curve_names)-1))
         
         # Get curves
         depth = las[depth_curve]
         IP = las[ip_curve]
         VP = las[vp_curve]
         VS = las[vs_curve]
-        FRAC_DEN = las[frac_curve]  # Fracture density data
         
         # Calculate VP/VS ratio
         VP_VS = VP / VS
-        
-        # Clean data - ensure all required curves have valid values
-        valid_idx = ~np.isnan(IP) & ~np.isnan(VP_VS) & ~np.isnan(FRAC_DEN)
-        depth = depth[valid_idx]
-        IP = IP[valid_idx]
-        VP_VS = VP_VS[valid_idx]
-        FRAC_DEN = FRAC_DEN[valid_idx]
         
         # Depth range selection
         st.subheader("Depth Range")
@@ -88,7 +89,62 @@ with st.sidebar:
         st.info("Please upload a LAS file to begin analysis")
         st.stop()
 
-# HF calculation function (corrected according to theory)
+# Functions to estimate fracture density
+def estimate_fracture_density(method, depth, VP, VS, IP, las, curve_name=None):
+    """
+    Estimate fracture density using various proxy methods
+    """
+    if method == "S-Wave Velocity Anomaly":
+        # Calculate moving average of VS
+        window_size = min(21, len(VS) // 10)  # Adaptive window size
+        if window_size % 2 == 0:  # Ensure window size is odd for Savitzky-Golay
+            window_size += 1
+            
+        VS_smooth = savgol_filter(VS, window_size, 2)  # Smooth VS
+        # Fractures typically reduce S-wave velocity
+        frac_estimate = (VS_smooth - VS) / VS_smooth
+        frac_estimate = np.clip(frac_estimate, 0, None)  # Keep only positive anomalies
+        
+    elif method == "P-Wave Velocity Anomaly":
+        # Calculate moving average of VP
+        window_size = min(21, len(VP) // 10)
+        if window_size % 2 == 0:
+            window_size += 1
+            
+        VP_smooth = savgol_filter(VP, window_size, 2)  # Smooth VP
+        # Fractures reduce P-wave velocity but less than S-wave
+        frac_estimate = (VP_smooth - VP) / VP_smooth
+        frac_estimate = np.clip(frac_estimate, 0, None)
+        
+    elif method == "Impedance Contrast":
+        # Calculate moving average of IP
+        window_size = min(21, len(IP) // 10)
+        if window_size % 2 == 0:
+            window_size += 1
+            
+        IP_smooth = savgol_filter(IP, window_size, 2)  # Smooth IP
+        # Fractures typically reduce impedance
+        frac_estimate = (IP_smooth - IP) / IP_smooth
+        frac_estimate = np.clip(frac_estimate, 0, None)
+        
+    elif method == "Sonic Log DTCO":
+        # Use sonic log (DTCO) as fracture indicator
+        DTCO = las[curve_name]
+        # Higher DTCO (slower velocity) often indicates fractures
+        # Normalize and invert so higher values = more fractures
+        dtco_norm = (DTCO - np.nanmin(DTCO)) / (np.nanmax(DTCO) - np.nanmin(DTCO))
+        frac_estimate = dtco_norm
+        
+    elif method == "Manual Curve Selection":
+        # Use selected curve as fracture proxy
+        frac_estimate = las[curve_name]
+        # Normalize
+        frac_estimate = (frac_estimate - np.nanmin(frac_estimate)) / \
+                       (np.nanmax(frac_estimate) - np.nanmin(frac_estimate))
+    
+    return frac_estimate
+
+# HF calculation function
 def calculate_HF(theta_deg, IP, VP_VS):
     """Calculate Horizontal Fracture indicator for a given angle"""
     theta_rad = np.deg2rad(theta_deg)
@@ -110,7 +166,24 @@ if calculate_btn:
         depth_interval = depth[mask]
         IP_interval = IP[mask]
         VP_VS_interval = VP_VS[mask]
-        FRAC_DEN_interval = FRAC_DEN[mask]
+        
+        # Estimate fracture density
+        if method == "Sonic Log DTCO":
+            FRAC_ESTIMATE = estimate_fracture_density(method, depth_interval, VP[mask], VS[mask], 
+                                                     IP_interval, las, dtco_curve)
+        elif method == "Manual Curve Selection":
+            FRAC_ESTIMATE = estimate_fracture_density(method, depth_interval, VP[mask], VS[mask], 
+                                                     IP_interval, las, frac_curve)
+        else:
+            FRAC_ESTIMATE = estimate_fracture_density(method, depth_interval, VP[mask], VS[mask], 
+                                                     IP_interval, las)
+        
+        # Clean data - ensure all required curves have valid values
+        valid_idx = ~np.isnan(IP_interval) & ~np.isnan(VP_VS_interval) & ~np.isnan(FRAC_ESTIMATE)
+        depth_interval = depth_interval[valid_idx]
+        IP_interval = IP_interval[valid_idx]
+        VP_VS_interval = VP_VS_interval[valid_idx]
+        FRAC_ESTIMATE = FRAC_ESTIMATE[valid_idx]
         
         # Calculate correlation for different theta values
         theta_values = np.linspace(0, 180, 181)  # 0 to 180 degrees in 1-degree increments
@@ -120,9 +193,9 @@ if calculate_btn:
             # Calculate HF for this theta across all depth points
             hf_values = calculate_HF(theta, IP_interval, VP_VS_interval)
             
-            # Calculate correlation with fracture density
+            # Calculate correlation with fracture estimate
             if len(hf_values) > 1:  # Ensure we have enough data points
-                r, _ = pearsonr(hf_values, FRAC_DEN_interval)
+                r, _ = pearsonr(hf_values, FRAC_ESTIMATE)
                 correlations.append(r)
             else:
                 correlations.append(0)
@@ -156,7 +229,7 @@ if calculate_btn:
         
         # Update layout
         fig_corr.update_layout(
-            title=f'<b>Correlation between HF(θ) and Fracture Density</b><br>'
+            title=f'<b>Correlation between HF(θ) and Fracture Estimate ({method})</b><br>'
                   f'<i>Depth: {depth_range[0]:.1f}m - {depth_range[1]:.1f}m</i>',
             xaxis_title='Rotation Angle θ (degrees)',
             yaxis_title='Correlation Coefficient (R)',
@@ -165,20 +238,20 @@ if calculate_btn:
             height=500
         )
         
-        # Create the HF vs Fracture Density crossplot at optimal angle
+        # Create the HF vs Fracture Estimate crossplot at optimal angle
         fig_crossplot = go.Figure()
         
         fig_crossplot.add_trace(go.Scatter(
-            x=hf_optimal, y=FRAC_DEN_interval,
+            x=hf_optimal, y=FRAC_ESTIMATE,
             mode='markers',
             name='Data points',
             marker=dict(size=4, opacity=0.6),
-            hovertemplate="HF: %{x:.2f}<br>Fracture Density: %{y:.3f}<extra></extra>"
+            hovertemplate="HF: %{x:.2f}<br>Fracture Estimate: %{y:.3f}<extra></extra>"
         ))
         
         # Add trend line
         if len(hf_optimal) > 1:
-            z = np.polyfit(hf_optimal, FRAC_DEN_interval, 1)
+            z = np.polyfit(hf_optimal, FRAC_ESTIMATE, 1)
             p = np.poly1d(z)
             trend_x = np.linspace(min(hf_optimal), max(hf_optimal), 100)
             trend_y = p(trend_x)
@@ -191,10 +264,10 @@ if calculate_btn:
             ))
         
         fig_crossplot.update_layout(
-            title=f'<b>HF(θ_max) vs Fracture Density</b><br>'
+            title=f'<b>HF(θ_max) vs Fracture Estimate</b><br>'
                   f'<i>θ_max = {theta_max:.1f}°, R = {max_correlation:.3f}</i>',
             xaxis_title=f'HF(θ_max)',
-            yaxis_title='Fracture Density (εf)',
+            yaxis_title='Fracture Estimate',
             template="plotly_white",
             height=500
         )
@@ -211,14 +284,14 @@ if calculate_btn:
         with col2:
             st.metric("Maximum Correlation", f"{max_correlation:.3f}")
         with col3:
-            st.metric("Data Points", f"{len(FRAC_DEN_interval)}")
+            st.metric("Data Points", f"{len(FRAC_ESTIMATE)}")
         
         # Additional details in expander
         with st.expander("Detailed Calculations"):
             st.write(f"**Formula at θ_max:** HF({theta_max:.1f}°) = IP·cos({theta_max:.1f}°) - VP/VS·sin({theta_max:.1f}°)")
             st.write(f"Mean IP: {np.mean(IP_interval):.2f}")
             st.write(f"Mean VP/VS: {np.mean(VP_VS_interval):.2f}")
-            st.write(f"Mean Fracture Density: {np.mean(FRAC_DEN_interval):.4f}")
+            st.write(f"Mean Fracture Estimate: {np.mean(FRAC_ESTIMATE):.4f}")
             
             # Show data statistics
             st.write("**Interval Statistics:**")
@@ -247,22 +320,58 @@ if calculate_btn:
             st.plotly_chart(fig_depth_hf, use_container_width=True)
             
         with col2:
-            st.write("Depth vs Fracture Density")
+            st.write("Depth vs Fracture Estimate")
             fig_depth_frac = go.Figure()
             fig_depth_frac.add_trace(go.Scatter(
-                x=FRAC_DEN_interval, y=depth_interval,
+                x=FRAC_ESTIMATE, y=depth_interval,
                 mode='lines',
-                name='Fracture Density',
+                name='Fracture Estimate',
                 line=dict(color='green', width=1)
             ))
             fig_depth_frac.update_layout(
-                xaxis_title='Fracture Density (εf)',
+                xaxis_title='Fracture Estimate',
                 yaxis_title='Depth',
                 yaxis=dict(autorange='reversed'),
                 template="plotly_white",
                 height=400
             )
             st.plotly_chart(fig_depth_frac, use_container_width=True)
+            
+        # Explanation of the selected method
+        st.subheader("Method Explanation")
+        if method == "S-Wave Velocity Anomaly":
+            st.info("""
+            **S-Wave Velocity Anomaly Method**: 
+            This method detects fractures by identifying intervals where S-wave velocity is lower than expected.
+            Fractures significantly reduce S-wave velocity more than P-wave velocity, creating detectable anomalies
+            when compared to a smoothed background trend.
+            """)
+        elif method == "P-Wave Velocity Anomaly":
+            st.info("""
+            **P-Wave Velocity Anomaly Method**: 
+            This method detects fractures by identifying intervals where P-wave velocity is lower than expected.
+            While P-wave is less sensitive to fractures than S-wave, it still shows measurable reductions in fractured zones.
+            """)
+        elif method == "Impedance Contrast":
+            st.info("""
+            **Impedance Contrast Method**: 
+            This method uses P-impedance (IP) anomalies to detect fractures. Fractured zones typically have 
+            lower impedance than intact rock, creating detectable contrasts against the background trend.
+            """)
+        elif method == "Sonic Log DTCO":
+            st.info("""
+            **Sonic Log (DTCO) Method**: 
+            This method uses compressional wave slowness (DTCO) as a fracture indicator. Higher DTCO values
+            (slower velocities) often correlate with fractured intervals. The curve is normalized to create
+            a fracture probability estimate.
+            """)
+        elif method == "Manual Curve Selection":
+            st.info(f"""
+            **Manual Curve Selection Method**: 
+            Using the {frac_curve} curve as a fracture indicator. This curve has been normalized to create
+            a fracture probability estimate. Ensure this curve has a physical relationship with fracturing
+            (e.g., resistivity anomalies, density changes, or other fracture-sensitive measurements).
+            """)
 
 # Display instructions if no calculation performed yet
 else:
@@ -274,11 +383,20 @@ else:
        - P-Impedance (IP) curve
        - P-wave velocity (VP) curve
        - S-wave velocity (VS) curve
-       - Fracture density (εf) curve (most important!)
-    3. Adjust the depth range if needed
-    4. Click 'Calculate HF Analysis' to see results
+    3. Choose a method to estimate fracture density
+    4. Adjust the depth range if needed
+    5. Click 'Calculate HF Analysis' to see results
     
     ### Note:
     This analysis finds the optimal rotation angle θ that maximizes correlation between
-    the HF attribute (IP·cosθ - VP/VS·sinθ) and measured fracture density.
+    the HF attribute (IP·cosθ - VP/VS·sinθ) and estimated fracture density.
+    
+    ### No Fracture Density Data?
+    If you don't have direct fracture measurements, the app provides several methods to estimate
+    fracture density from commonly available logs:
+    - **S-Wave Velocity Anomaly**: Detects fractures as negative anomalies in S-wave velocity
+    - **P-Wave Velocity Anomaly**: Detects fractures as negative anomalies in P-wave velocity  
+    - **Impedance Contrast**: Uses P-impedance anomalies to identify fractured zones
+    - **Sonic Log DTCO**: Uses sonic slowness as a fracture indicator
+    - **Manual Selection**: Choose any curve that might correlate with fractures
     """)
